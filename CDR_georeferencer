@@ -1,1 +1,197 @@
+#!/usr/bin/env python3
 
+import concurrent.futures
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+# ---------------------------------------------------------------------
+# Default Moon Map Projection
+# ---------------------------------------------------------------------
+
+DEFAULT_MAP = """Group = Mapping
+  ProjectionName     = Equirectangular
+  CenterLongitude    = 0.0
+  CenterLatitude     = 0.0
+  TargetName         = Moon
+  EquatorialRadius   = 1737400.0 <meters>
+  PolarRadius        = 1737400.0 <meters>
+  LatitudeType       = Planetocentric
+  LongitudeDirection = PositiveEast
+  LongitudeDomain    = 180
+End_Group
+"""
+
+# ---------------------------------------------------------------------
+# ISIS Command Utilities
+# ---------------------------------------------------------------------
+
+ISIS_COMMANDS = [
+    "pds2isis",
+    "lronac2isis",
+    "fx",
+    "spiceinit",
+    "cam2map",
+    "isis2std"
+]
+
+def verify_isis():
+    missing = [cmd for cmd in ISIS_COMMANDS if shutil.which(cmd) is None]
+    if missing:
+        print("\nERROR: Missing ISIS commands:")
+        for m in missing:
+            print(f"  {m}")
+        sys.exit(1)
+
+def run_command(cmd, description):
+    try:
+        subprocess.run(cmd, capture_output=True, text=True, check=True)
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"\n[FAILED] {description}")
+        print(e.stderr)
+        return False
+
+# ---------------------------------------------------------------------
+# CDR Spoof
+# ---------------------------------------------------------------------
+
+def spoof_cdr(input_img, spoof_img):
+    with open(input_img, "rb") as fin:
+        data = fin.read()
+
+    data = data.replace(b"LRO-L-LROC-3-CDR-V1.0", b"LRO-L-LROC-2-EDR-V1.0")
+    data = data.replace(b"LRO-L-LROC-4-CDR-V1.0", b"LRO-L-LROC-2-EDR-V1.0")
+
+    with open(spoof_img, "wb") as fout:
+        fout.write(data)
+
+# ---------------------------------------------------------------------
+# Projection Template
+# ---------------------------------------------------------------------
+
+def create_map_template(output_dir):
+    mapfile = Path(output_dir) / "moon.map"
+    if not mapfile.exists():
+        with open(mapfile, "w") as f:
+            f.write(DEFAULT_MAP)
+    return str(mapfile)
+
+# ---------------------------------------------------------------------
+# Single Image Processing
+# ---------------------------------------------------------------------
+
+def process_image(img_path, output_dir, mapfile):
+    img_path = Path(img_path)
+    stem = img_path.stem
+    final_tif = Path(output_dir) / f"{stem}_georef.tif"
+
+    if final_tif.exists():
+        return f"Skipped: {img_path.name}"
+
+    try:
+        with tempfile.TemporaryDirectory() as tempdir:
+            tempdir = Path(tempdir)
+            spoof_img = tempdir / "spoof.IMG"
+            
+            # Intermediate cubes
+            header_cube = tempdir / "header.cub"
+            pixels_cube = tempdir / "pixels.cub"
+            merged_cube = tempdir / "merged.cub"
+            proj_cube = tempdir / "projected.cub"
+
+            print(f"\nProcessing {img_path.name}...")
+
+            # 1. Spoof the header
+            spoof_cdr(img_path, spoof_img)
+
+            # 2. Extract Perfect Labels (Pixels will be scrambled, but we don't care)
+            if not run_command(["lronac2isis", f"from={spoof_img}", f"to={header_cube}"], f"lronac2isis {img_path.name}"):
+                return f"FAILED LABELS: {img_path.name}"
+
+            # 3. Extract Perfect Pixels (Labels will be missing, but we don't care)
+            if not run_command(["pds2isis", f"from={img_path}", f"to={pixels_cube}"], f"pds2isis {img_path.name}"):
+                return f"FAILED PIXELS: {img_path.name}"
+
+            # 4. Frankenstein Merge: Inject pristine pixels into the perfect label cube
+            # 'fx' propagates labels from f1, and calculates pixels using equation (f2)
+            if not run_command(["fx", f"f1={header_cube}", f"f2={pixels_cube}", f"to={merged_cube}", "equation=f2"], f"fx merge {img_path.name}"):
+                return f"FAILED MERGE: {img_path.name}"
+
+            # 5. Initialize SPICE (Bypass DEMs using shape=ellipsoid)
+            if not run_command(["spiceinit", f"from={merged_cube}", "web=yes", "shape=ellipsoid"], f"spiceinit {img_path.name}"):
+                return f"FAILED SPICEINIT: {img_path.name}"
+
+            # 6. Map Projection
+            if not run_command(["cam2map", f"from={merged_cube}", f"to={proj_cube}", f"map={mapfile}", "pixres=camera", "defaultrange=camera"], f"cam2map {img_path.name}"):
+                return f"FAILED CAM2MAP: {img_path.name}"
+
+            # 7. Export properly stretched 16-bit GeoTIFF
+            if not run_command([
+                "isis2std",
+                f"from={proj_cube}",
+                f"to={final_tif}",
+                "format=tiff",
+                "bittype=u16bit",
+                "stretch=linear",
+                "minpercent=1.0",
+                "maxpercent=99.0"
+            ], f"isis2std {img_path.name}"):
+                return f"FAILED EXPORT: {img_path.name}"
+
+            return f"SUCCESS: {final_tif.name}"
+
+    except Exception as e:
+        return f"FAILED {img_path.name}: {e}"
+
+# ---------------------------------------------------------------------
+# Batch Processing
+# ---------------------------------------------------------------------
+
+def batch_process(input_dir, output_dir, workers):
+    input_dir = Path(input_dir)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    mapfile = create_map_template(output_dir)
+
+    imgs = sorted(list(input_dir.glob("*.IMG")) + list(input_dir.glob("*.img")))
+
+    if not imgs:
+        print("No IMG files found.")
+        return
+
+    print(f"\nFound {len(imgs)} image(s)\n")
+    success = 0
+
+    with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as executor:
+        futures = [executor.submit(process_image, img, output_dir, mapfile) for img in imgs]
+        for future in concurrent.futures.as_completed(futures):
+            result = future.result()
+            print(result)
+            if result.startswith("SUCCESS"):
+                success += 1
+
+    print("\n------------------------------------------------")
+    print(f"Completed: {success}/{len(imgs)}")
+    print("------------------------------------------------")
+
+def main():
+    verify_isis()
+    print("=" * 60)
+    print("LROC NAC CDR GEOREFERENCER")
+    print("=" * 60)
+
+    input_dir = input("Input folder [./input]: ").strip() or "./input"
+    output_dir = input("Output folder [./output]: ").strip() or "./output"
+    
+    default_workers = max(1, (os.cpu_count() or 2) - 1)
+    workers = input(f"Workers [{default_workers}]: ").strip()
+    workers = int(workers) if workers.isdigit() else default_workers
+
+    batch_process(input_dir, output_dir, workers)
+
+if __name__ == "__main__":
+    main()
